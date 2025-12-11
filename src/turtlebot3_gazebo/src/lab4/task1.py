@@ -159,8 +159,8 @@ class Task1(Node):
 
         self.create_subscription(OccupancyGrid, '/map', self.map_cb, 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.path_pub = self.create_publisher(Path, '/vis/global_plan', 10)
-        self.frontier_pub = self.create_publisher(Marker, '/vis/frontiers', 10)
+        self.path_pub = self.create_publisher(Path, '/global_plan', 10)
+        self.frontier_pub = self.create_publisher(Marker, '/frontiers', 10)
         
         self.create_timer(0.1, self.control_loop)
     
