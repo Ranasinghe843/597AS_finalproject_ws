@@ -17,8 +17,8 @@ from ament_index_python.packages import get_package_share_directory
 import pandas as pd
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-import time
+
+# Import other python packages that you think necessary
 
 class Map():
     def __init__(self, map_name):
@@ -297,22 +297,25 @@ class AStarFast:
         path.reverse()
         return path, dist
 
-class Task3(Node):
+class Task1(Node):
+    """
+    Environment mapping task.
+    """
     def __init__(self):
-        super().__init__('task3_node')
-        
+        super().__init__('task1_node')
+        self.timer = self.create_timer(0.1, self.timer_cb)
+        # Fill in the initialization member variables that you need
+        self.waiting = 1
         self.path = Path()
         self.goal_pose = PoseStamped()
         self.ttbot_pose = PoseStamped()
+        self.start_time = 0.0
 
         self.goal_ready = False
-        self.pose_ready = True
+        self.pose_ready = False
         self.plan_computed = False
         self.plan_dirty = False
         self.replan_needed = False
-        self.goal_reached = True
-        self.goal_list = [[7.57, -5.42], [2.61, 0.49]]
-        self.current_goal = -1
 
         self.follow_idx = 0
         self.wp_reached_thresh = 0.25
@@ -330,59 +333,24 @@ class Task3(Node):
         self.narrow_lin = 0.15              # [m/s] slower linear speed in narrow spaces
         self.rotate_only_err = 1.0          # [rad] if heading error > this, rotate in place
 
-        qos_sensor = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-
-        # Subscribers
+        self.create_subscription(PoseStamped, '/move_base_simple/goal', self.__goal_pose_cbk, 10)
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.__ttbot_pose_cbk, 10)
-        self.create_subscription(LaserScan, '/scan', self.__scan_cb, qos_sensor)
 
         # Publishers
         self.path_pub = self.create_publisher(Path, 'global_plan', 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.debug_pub = self.create_publisher(OccupancyGrid, '/debug_map', 10)
-
-        # Map File Load
-        self.map_file_path = os.path.join(get_package_share_directory('turtlebot3_gazebo'), "maps", "map")
-        self.get_logger().info(self.map_file_path)
-        self.mp_running = MapProcessor(self.map_file_path)
-        self.running_kr = 6
-        self.mp_running.inflate_map(self.mp_running.rect_kernel(self.running_kr,1), True)
-        self.mp = MapProcessor(self.map_file_path)
-        self.kr = 11
-        self.mp.inflate_map(self.mp.rect_kernel(self.kr,1), True)
-        self.mp.get_graph_from_map()
-        self.graph_built = True
-        self.map_ready = True
-        h, w = self.mp.map.image_array.shape
-        self.get_logger().info(
-            f"Local map loaded: {w}x{h}, nodes={len(self.mp.map_graph.g)}"
-        )
-
-        self.rate = self.create_rate(10)
-
-    def set_next_goal_pose(self):
+    
+    def __goal_pose_cbk(self, data):
         """! Callback to catch the goal pose.
         @param  data    PoseStamped object from RVIZ.
         @return None.
         """
-        self.goal_reached = False
-        self.current_goal += 1
+        self.goal_pose = data
         self.goal_pose.header.frame_id = "map"
-        self.goal_pose.header.stamp = self.get_clock().now().to_msg()
-        self.goal_pose.pose.position.x = self.goal_list[self.current_goal][0]
-        self.goal_pose.pose.position.y = self.goal_list[self.current_goal][1]
-        self.goal_pose.pose.orientation.w = 1.0
-
-        self.mp_running = MapProcessor(self.map_file_path)
-        self.mp_running.inflate_map(self.mp_running.rect_kernel(self.running_kr,1), True)
-        self.mp = MapProcessor(self.map_file_path)
-        self.mp.inflate_map(self.mp.rect_kernel(self.kr,1), True)
-        self.graph_built = False
         self.goal_ready = True
         self.plan_dirty = True
         self.get_logger().info(
-            'goal_pose: {:.4f}, {:.4f}'.format(self.goal_pose.pose.position.x, self.goal_pose.pose.position.y)
-        )
+            'goal_pose: {:.4f}, {:.4f}'.format(self.goal_pose.pose.position.x, self.goal_pose.pose.position.y))
 
     def __ttbot_pose_cbk(self, data):
         """! Callback to catch the position of the vehicle.
@@ -394,147 +362,8 @@ class Task3(Node):
         self.ttbot_pose.header.frame_id = "map"
         self.pose_ready = True
         self.get_logger().info(
-            'ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y)
-        )
-    
-    def world_to_grid(self, x, y):
+            'ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
         
-        res = self.mp.map.map_df.resolution[0]
-        ox, oy, _ = self.mp.map.map_df.origin[0]
-        H, W = self.mp.map.image_array.shape
-
-        cx = (x - ox) / res
-        cy = (y - oy) / res
-
-        ix = int(math.floor(cx))
-        iy_from_bottom = int(math.floor(cy))
-        iy = (H - 1) - iy_from_bottom
-
-        return ix, iy
-
-
-    def grid_to_world(self, ix, iy):
-        
-        res = self.mp.map.map_df.resolution[0]
-        ox, oy, _ = self.mp.map.map_df.origin[0]
-        H, W = self.mp.map.image_array.shape
-
-        iy_from_bottom = (H - 1) - iy
-
-        x = ox + (ix + 0.5) * res
-        y = oy + (iy_from_bottom + 0.5) * res
-        return x, y
-    
-    def publish_debug_map(self):
-        """Publishes the internal inflated map to Rviz."""
-        if self.mp.inf_map_img_array is None:
-            return
-
-        msg = OccupancyGrid()
-        msg.header.frame_id = "map"
-        msg.header.stamp = self.get_clock().now().to_msg()
-
-        # Copy metadata from the original map configuration
-        msg.info.resolution = float(self.mp.map.map_df.resolution[0])
-        msg.info.width = int(self.mp.map.image_array.shape[1])
-        msg.info.height = int(self.mp.map.image_array.shape[0])
-        
-        # Origin
-        msg.info.origin.position.x = float(self.mp.map.map_df.origin[0][0])
-        msg.info.origin.position.y = float(self.mp.map.map_df.origin[0][1])
-        msg.info.origin.position.z = 0.0
-        msg.info.origin.orientation.w = 1.0
-
-        # --- THE FIX ---
-        # 1. Flip the array upside down (Vertical Flip)
-        # Because PIL/NumPy (0,0 is Top-Left) vs ROS (0,0 is Bottom-Left)
-        corrected_array = np.flipud(self.mp.inf_map_img_array)
-
-        # 2. Flatten and Cast
-        # Map 255 (Obstacle) -> 100 for Rviz
-        flat_data = corrected_array.flatten()
-        flat_data = np.where(flat_data > 0, 100, 0).astype(np.int8)
-        
-        msg.data = flat_data.tolist()
-        self.debug_pub.publish(msg)
-    
-    def __scan_cb(self, msg):
-        """! Callback to process Lidar data, update map, and trigger replanning."""
-        if not self.pose_ready or not self.map_ready:
-            return
-
-        # 1. Get current robot pose
-        rx = self.ttbot_pose.pose.position.x
-        ry = self.ttbot_pose.pose.position.y
-        yaw = self._yaw_from_quat(self.ttbot_pose.pose.orientation)
-
-        ranges = np.array(msg.ranges)
-        
-        # Optimization: Only process obstacles within 1.0 meter. 
-        valid_indices = np.where((ranges < 1.0) & (ranges > 0.05))[0]
-        
-        map_changed = False
-        H, W = self.mp.inf_map_img_array.shape
-        
-        # Kernel Radius: You used rect_kernel(11,1), so radius is 5 (11 // 2)
-        #kr_inf_radius = self.kr // 2
-        kr_inf_radius = 2
-        kr_running_inf_radius = self.running_kr // 2
-
-        for i in valid_indices:
-            r = ranges[i]
-            theta = msg.angle_min + i * msg.angle_increment
-            
-            # 2. Global Coordinates
-            ox = rx + r * math.cos(yaw + theta)
-            oy = ry + r * math.sin(yaw + theta)
-            
-            # 3. Grid Coordinates
-            ix, iy = self.world_to_grid(ox, oy)
-
-            # 4. Update Map LOCALLY
-            if 0 <= ix < W and 0 <= iy < H:
-                # Check center pixel. If it's 0 (free), this is a NEW obstacle.
-                if self.mp_running.inf_map_img_array[iy, ix] == 0:
-                    map_changed = True
-
-                    x_min = max(0, ix - kr_running_inf_radius)
-                    x_max = min(W, ix + kr_running_inf_radius + 1)
-                    y_min = max(0, iy - kr_running_inf_radius)
-                    y_max = min(H, iy + kr_running_inf_radius + 1)
-                    self.mp_running.inf_map_img_array[y_min:y_max, x_min:x_max] = 100
-                    
-                    x_min = max(0, ix - kr_inf_radius)
-                    x_max = min(W, ix + kr_inf_radius + 1)
-                    y_min = max(0, iy - kr_inf_radius)
-                    y_max = min(H, iy + kr_inf_radius + 1)
-                    self.mp.inf_map_img_array[y_min:y_max, x_min:x_max] = 100
-
-        # 5. Collision Check & Re-planning
-        # Only runs if we actually added new obstacles
-        if map_changed and self.path.poses:
-            # Check the next 20 waypoints to see if the new obstacle blocks our path
-            start_check = self.follow_idx
-            end_check = min(len(self.path.poses), self.follow_idx + 20)
-            
-            collision_detected = False
-            for k in range(start_check, end_check):
-                wp = self.path.poses[k].pose.position
-                wx, wy = self.world_to_grid(wp.x, wp.y)
-                
-                if 0 <= wx < W and 0 <= wy < H:
-                    # If path waypoint is now inside an obstacle (value > 0)
-                    if self.mp.inf_map_img_array[wy, wx] > 0:
-                        collision_detected = True
-                        break
-            
-            if collision_detected:
-                self.get_logger().warn("Path Blocked by Dynamic Obstacle! Replanning...")
-                self.move_ttbot(0.0, 0.0) # Stop immediately
-                self.path = Path()        # Clear current path
-                self.plan_dirty = True    # Request A*
-                self.graph_built = False  # Force graph rebuild
-
     def a_star_path_planner(self, start_pose, end_pose):
         """! A Start path planner.
         @param  start_pose    PoseStamped object containing the start of the path to be created.
@@ -573,7 +402,14 @@ class Task3(Node):
         self.mp.map_graph.end = g_key
         solver = AStarFast(self.mp.map_graph)
 
+
+        self.start_time = self.get_clock().now().nanoseconds*1e-9 #Do not edit this line (required for autograder)
         solver.solve(self.mp.map_graph.g[self.mp.map_graph.root], self.mp.map_graph.g[self.mp.map_graph.end])
+        # Do not edit below (required for autograder)
+        self.astarTime = Float32()
+        self.astarTime.data = float(self.get_clock().now().nanoseconds*1e-9-self.start_time)
+        self.calc_time_pub.publish(self.astarTime)
+
         
         path_as, dist_as = solver.reconstruct_path(self.mp.map_graph.g[self.mp.map_graph.root], self.mp.map_graph.g[self.mp.map_graph.end])
 
@@ -592,7 +428,7 @@ class Task3(Node):
         self.get_logger().info(f"A* done")
         
         return path
-
+        
     def get_path_idx(self, path, vehicle_pose):
         """! Path follower.
         @param  path                  Path object containing the sequence of waypoints of the created path.
@@ -689,11 +525,11 @@ class Task3(Node):
             final_p = self.path.poses[-1].pose.position
             d_goal = math.hypot(final_p.x - rx, final_p.y - ry)
             if d_goal < self.stop_radius:
-                self.goal_reached = True
                 return 0.0, 0.0
 
         return v_cmd, w_cmd
 
+    # Define function(s) that complete the (automatic) mapping task
     def move_ttbot(self, speed, heading):
         """! Function to move turtlebot passing directly a heading angle and the speed.
         @param  speed     Desired speed.
@@ -707,45 +543,23 @@ class Task3(Node):
 
         self.cmd_vel_pub.publish(cmd_vel)
     
-    def _tick(self):
-        self.publish_debug_map()
-        if self.goal_reached and self.current_goal < (len(self.goal_list) - 1):
-            self.set_next_goal_pose()
-        if self.map_ready and self.pose_ready and self.goal_ready and (self.plan_dirty or not self.plan_computed):
-            self.follow_idx = 0
-            self.path = self.a_star_path_planner(self.ttbot_pose, self.goal_pose)
-            self.path_pub.publish(self.path)
-            self.plan_computed = True
-            self.plan_dirty = False
-        if self.path.poses:
-            idx = self.get_path_idx(self.path, self.ttbot_pose)
-            self.get_logger().info(f"Index: {idx}")
-            current_goal = self.path.poses[idx]
-            self.get_logger().info(f"Current: {current_goal.pose.position.x}, Goal: {current_goal.pose.position.y}")
-            speed, heading = self.path_follower(self.ttbot_pose, current_goal)
-            self.get_logger().info(f"Speed: {speed}, Heading: {heading}")
-            self.move_ttbot(speed, heading)
-
-    def run(self):
-        """! Main loop of the node. You need to wait until a new pose is published, create a path and then
-        drive the vehicle towards the final pose.
-        @param none
-        @return none
-        """
-        self.create_timer(0.1, self._tick)
-        self.get_logger().info("Timer started; entering rclpy.spin()")
-        rclpy.spin(self)
+    def timer_cb(self):
+        self.get_logger().info('Task1 node is alive.', throttle_duration_sec=1)
+        # Feel free to delete this line, and write your algorithm in this callback function
+        if self.waiting:
+            self.move_ttbot(0.12, 0.5)
 
 def main(args=None):
     rclpy.init(args=args)
-    task3 = Task3()
+
+    task1 = Task1()
 
     try:
-        task3.run()
+        rclpy.spin(task1)
     except KeyboardInterrupt:
         pass
     finally:
-        task3.destroy_node()
+        task1.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
