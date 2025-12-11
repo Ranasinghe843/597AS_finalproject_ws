@@ -4,16 +4,17 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist, Point
 from nav_msgs.msg import Path, OccupancyGrid
-from std_msgs.msg import Float32, ColorRGBA
+from std_msgs.msg import Float32, ColorRGBA, Header
 from visualization_msgs.msg import Marker
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 import numpy as np
 import math
 import heapq
+import time
 
 # =========================================
-# HELPER CLASS: Grid-Based A* with Costs
+# HELPER CLASS: Grid-Based A*
 # =========================================
 class GridAStar:
     def __init__(self, resolution, origin_x, origin_y, width, height):
@@ -45,16 +46,12 @@ class GridAStar:
         came_from = {}
         g_score = { (sx, sy): 0 }
         
+        # 8-Connected Neighbors
         motions = [
             (1, 0, 1), (-1, 0, 1), (0, 1, 1), (0, -1, 1),
             (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)
         ]
 
-        # --- SAFETY PARAMETERS ---
-        # 4 cells * 0.05m = 20cm. Robot radius is ~15cm.
-        # This keeps the CENTER of the robot 20cm away from walls.
-        wall_padding = 4 
-        
         found = False
         
         while open_set:
@@ -69,57 +66,24 @@ class GridAStar:
             for dx, dy, cost in motions:
                 nx, ny = cx + dx, cy + dy
                 
+                # Check Bounds
                 if 0 <= nx < self.w and 0 <= ny < self.h:
                     
-                    # 1. CRITICAL CHECK: Center pixel must be free
-                    center_val = grid[ny, nx]
-                    if center_val > 50 or center_val == -1: 
+                    # Check Obstacles in the INFLATED MAP
+                    # Since we pass the inflated map to this solver, 
+                    # we only need to check if the pixel is > 0.
+                    # 0 = Safe Free Space
+                    # 100 = Wall or Buffer Zone
+                    # -1 = Unknown
+                    
+                    cell_val = grid[ny, nx]
+                    
+                    # Strict check: Can only move through KNOWN FREE space (0)
+                    # We treat Unknown (-1) as obstacle for path planning safety
+                    if cell_val != 0: 
                         continue
 
-                    # 2. SAFETY CHECK
-                    is_safe = True
-                    proximity_cost = 0.0
-                    
-                    # Scan the local box
-                    for r in range(ny - wall_padding, ny + wall_padding + 1):
-                        for c in range(nx - wall_padding, nx + wall_padding + 1):
-                            if 0 <= r < self.h and 0 <= c < self.w:
-                                val = grid[r, c]
-                                
-                                # A. WALLS: Strict avoidance
-                                if val > 50:
-                                    is_safe = False
-                                    break
-                                
-                                # B. UNKNOWN: Loose avoidance
-                                # Only fail if we are RIGHT next to unknown (radius 1)
-                                # This allows passing through doorways where unknown is close
-                                if val == -1:
-                                    dist = max(abs(r-ny), abs(c-nx))
-                                    if dist <= 1: 
-                                        # Only unsafe if VERY close to unknown
-                                        # (prevents driving off map)
-                                        # But we allow it near goal (frontier)
-                                        if math.hypot(nx-gx, ny-gy) > 2: # Ignore near goal
-                                            is_safe = False
-                                            break
-                                            
-                                # C. COST INFLATION (The "Middle of Hallway" Logic)
-                                # If we are safe but close to a wall, add a penalty cost.
-                                # This makes the planner prefer the center of open spaces.
-                                if val > 50: # If there is a wall nearby (within padding)
-                                    dist = math.hypot(r-ny, c-nx)
-                                    if dist < wall_padding:
-                                        proximity_cost += (wall_padding - dist) * 2.0 # Penalty
-
-                        if not is_safe: break
-                    
-                    if not is_safe: continue
-
-                    # 3. COST CALCULATION
-                    # Base Cost + Proximity Penalty
-                    new_g = g_score[current] + cost + proximity_cost
-                    
+                    new_g = g_score[current] + cost
                     if (nx, ny) not in g_score or new_g < g_score[(nx, ny)]:
                         g_score[(nx, ny)] = new_g
                         priority = new_g + math.hypot(nx-gx, ny-gy)
@@ -144,23 +108,34 @@ class Task1(Node):
     def __init__(self):
         super().__init__('task1_node')
         
-        self.state = "WAITING" 
+        self.state = "START" 
         self.path = []
-        self.current_map = None
+        
+        # Maps
+        self.raw_map = None      # The raw data from SLAM
+        self.inflated_map = None # The processed map with safety buffers
         self.map_data = None 
+        
         self.current_goal = None
         self.follow_idx = 0
         self.blacklist = []
         
+        # Parameters
         self.lookahead_dist = 0.4
+        self.inflation_radius = 5 # Cells (approx 20cm)
         
+        # TF
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # Communication
         self.create_subscription(OccupancyGrid, '/map', self.map_cb, 10)
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.path_pub = self.create_publisher(Path, '/global_plan', 10)
-        self.frontier_pub = self.create_publisher(Marker, '/frontiers', 10)
+        
+        # Vis
+        self.path_pub = self.create_publisher(Path, 'global_plan', 10)
+        self.frontier_pub = self.create_publisher(Marker, 'frontiers', 10)
+        self.debug_map_pub = self.create_publisher(OccupancyGrid, '/debug_map', 10)
         
         self.create_timer(0.1, self.control_loop)
     
@@ -179,31 +154,88 @@ class Task1(Node):
 
     def map_cb(self, msg):
         self.map_data = msg.info
+        # ROS data is row-major, convert to 2D numpy
         raw = np.array(msg.data, dtype=np.int8)
-        self.current_map = raw.reshape((msg.info.height, msg.info.width))
+        self.raw_map = raw.reshape((msg.info.height, msg.info.width))
+
+    def generate_inflated_map(self):
+        """
+        Creates a new map where walls are thicker.
+        Returns the 2D numpy array of the inflated map.
+        """
+        if self.raw_map is None: return None
+        
+        # Copy raw map
+        inflated = self.raw_map.copy()
+        
+        # Find walls (100)
+        # Note: We treat > 50 as walls
+        wall_indices = np.where(self.raw_map > 0)
+        
+        # If map is empty, return
+        if len(wall_indices[0]) == 0: return inflated
+
+        # Create a list of (y, x) tuples for walls
+        walls = list(zip(wall_indices[0], wall_indices[1]))
+        
+        # Simple Inflation: Draw a box around every wall pixel
+        # (Using NumPy slicing for speed instead of iterating every pixel)
+        H, W = inflated.shape
+        r = self.inflation_radius
+        
+        # Create a mask for walls to speed up dilation
+        wall_mask = (self.raw_map > 0)
+        
+        # Dilate using array shifting (Faster than scipy for simple kernels)
+        # We shift the wall mask in all directions and combine them
+        expanded_walls = wall_mask.copy()
+        for y_shift in range(-r, r + 1):
+            for x_shift in range(-r, r + 1):
+                if x_shift == 0 and y_shift == 0: continue
+                # Roll/Shift the array
+                shifted = np.roll(wall_mask, shift=(y_shift, x_shift), axis=(0, 1))
+                expanded_walls |= shifted
+        
+        # Apply inflated walls to the map (Mark as 100)
+        # However, we must preserve Unknown (-1).
+        # Only overwrite Free (0) or Unknown (-1) with Wall (100) if it's in the buffer.
+        # Actually, for A*, we want the buffer to be "Forbidden".
+        # So we set expanded areas to 100.
+        inflated[expanded_walls] = 100
+        
+        return inflated
+
+    def publish_debug_map(self, grid_2d):
+        """Publishes the Inflated Map to Rviz for debugging."""
+        if grid_2d is None: return
+        
+        msg = OccupancyGrid()
+        msg.header.frame_id = "map"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info = self.map_data # Use same metadata as original map
+        
+        # Flatten and cast
+        flat = grid_2d.flatten().astype(np.int8)
+        msg.data = flat.tolist()
+        
+        self.debug_map_pub.publish(msg)
 
     def get_frontiers(self):
-        """Finds centroids of frontiers, filtering those too close to walls."""
-        if self.current_map is None: return None
+        """
+        Finds frontiers using the INFLATED map.
+        This ensures all found points are strictly outside the safety buffer.
+        """
+        if self.inflated_map is None: return None
 
-        h, w = self.current_map.shape
-        grid = self.current_map
+        h, w = self.inflated_map.shape
+        grid = self.inflated_map
         
+        # Masks
         free_mask = (grid == 0)
         unknown_mask = (grid == -1)
-        wall_mask = (grid > 50) # Strict walls
+        # Note: 'grid' already has walls inflated to 100.
         
-        # 1. Expand Walls (Dilation)
-        # We want to ignore any frontier that is within 3 pixels of a wall
-        # to prevent "Wall Hugging" goals.
-        d_range = 3
-        expanded_wall = wall_mask.copy()
-        for r in range(-d_range, d_range+1):
-            for c in range(-d_range, d_range+1):
-                shift = np.roll(wall_mask, shift=(r, c), axis=(0, 1))
-                expanded_wall |= shift
-
-        # 2. Find Edges
+        # Edge Detection
         up = np.roll(unknown_mask, -1, axis=0)
         down = np.roll(unknown_mask, 1, axis=0)
         left = np.roll(unknown_mask, -1, axis=1)
@@ -211,15 +243,15 @@ class Task1(Node):
         
         has_unknown_neighbor = up | down | left | right
         
-        # Frontier = Free AND Touching Unknown AND NOT near Wall
-        is_frontier = free_mask & has_unknown_neighbor & (~expanded_wall)
+        # Frontier = Free Space (Safe) AND Touching Unknown
+        is_frontier = free_mask & has_unknown_neighbor
         
         ys, xs = np.where(is_frontier)
         points = list(zip(xs, ys)) 
 
         if not points: return None
 
-        # 3. Cluster
+        # Clustering
         clusters = []
         visited = set()
         
@@ -249,20 +281,36 @@ class Task1(Node):
             if len(current_cluster) > 5:
                 clusters.append(current_cluster)
 
-        # 4. Centroids
+        # Centroid Calculation (Snap to Valid Pixel)
         centroids = []
         res = self.map_data.resolution
         ox = self.map_data.origin.position.x
         oy = self.map_data.origin.position.y
         
         for cluster in clusters:
+            # 1. Geometric Centroid
             sum_x = sum(p[0] for p in cluster)
             sum_y = sum(p[1] for p in cluster)
             avg_x = sum_x / len(cluster)
             avg_y = sum_y / len(cluster)
             
-            wx = (avg_x * res) + ox + (res/2)
-            wy = (avg_y * res) + oy + (res/2)
+            # 2. Find the pixel in the cluster closest to the geometric centroid
+            # This ensures the target is actually a valid frontier pixel (Free space)
+            best_pixel = cluster[0]
+            min_dist = float('inf')
+            
+            for p in cluster:
+                dist = (p[0] - avg_x)**2 + (p[1] - avg_y)**2
+                if dist < min_dist:
+                    min_dist = dist
+                    best_pixel = p
+            
+            # Use that valid pixel as the target
+            cx, cy = best_pixel
+            
+            # Convert to World
+            wx = (cx * res) + ox + (res/2)
+            wy = (cy * res) + oy + (res/2)
             centroids.append((wx, wy))
             
         return centroids
@@ -288,62 +336,36 @@ class Task1(Node):
         return best_point
 
     def publish_frontiers(self, centroids, selected=None):
-        """
-        Publishes:
-        1. Red dots for all candidate frontiers.
-        2. A large Green sphere for the SELECTED frontier.
-        """
         if not centroids: return
-        
-        timestamp = self.get_clock().now().to_msg()
-
-        # --- 1. CANDIDATES (RED DOTS) ---
         marker = Marker()
         marker.header.frame_id = "map"
-        marker.header.stamp = timestamp
+        marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "frontiers"
         marker.id = 0
         marker.type = Marker.POINTS
         marker.action = Marker.ADD
-        marker.scale.x = 0.2
-        marker.scale.y = 0.2
-        marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0) # Red
-        
+        marker.scale.x = 0.2; marker.scale.y = 0.2
+        marker.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)
         for (x, y) in centroids:
-            # Optional: Don't draw a red dot under the green sphere
-            if selected and x == selected[0] and y == selected[1]:
-                continue
-                
-            p = Point()
-            p.x = float(x)
-            p.y = float(y)
-            p.z = 0.0
+            if selected and x == selected[0] and y == selected[1]: continue
+            p = Point(); p.x = float(x); p.y = float(y); p.z = 0.0
             marker.points.append(p)
-            
         self.frontier_pub.publish(marker)
 
-        # --- 2. SELECTED TARGET (GREEN SPHERE) ---
         if selected:
-            marker_sel = Marker()
-            marker_sel.header.frame_id = "map"
-            marker_sel.header.stamp = timestamp
-            marker_sel.ns = "frontiers"
-            marker_sel.id = 1 # Different ID to separate from the list
-            marker_sel.type = Marker.SPHERE
-            marker_sel.action = Marker.ADD
-            
-            # Make it bigger so it stands out
-            marker_sel.scale.x = 0.4 
-            marker_sel.scale.y = 0.4
-            marker_sel.scale.z = 0.4
-            marker_sel.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0) # Green
-            
-            marker_sel.pose.position.x = float(selected[0])
-            marker_sel.pose.position.y = float(selected[1])
-            marker_sel.pose.position.z = 0.0
-            marker_sel.pose.orientation.w = 1.0
-            
-            self.frontier_pub.publish(marker_sel)
+            sel = Marker()
+            sel.header.frame_id = "map"
+            sel.header.stamp = self.get_clock().now().to_msg()
+            sel.ns = "frontiers"
+            sel.id = 1
+            sel.type = Marker.SPHERE
+            sel.action = Marker.ADD
+            sel.scale.x = 0.4; sel.scale.y = 0.4; sel.scale.z = 0.4
+            sel.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+            sel.pose.position.x = float(selected[0])
+            sel.pose.position.y = float(selected[1])
+            sel.pose.orientation.w = 1.0
+            self.frontier_pub.publish(sel)
 
     def publish_plan(self, path_points):
         if not path_points: return
@@ -361,21 +383,41 @@ class Task1(Node):
         if not pose: return
         rx, ry, yaw = pose
 
-        if self.state == "WAITING":
-            self.move_ttbot(0.15, 0.5) # Spin to improve map
+        if self.state == "START":
+            self.move_ttbot(0.15, 0.5) 
             
-            if self.current_map is not None:
+            # 1. Update and Publish Inflated Map
+            self.inflated_map = self.generate_inflated_map()
+            self.publish_debug_map(self.inflated_map)
+            
+            if self.inflated_map is not None:
                 self.get_logger().info("Detecting Frontiers...")
                 frontiers = self.get_frontiers()
-                
-                # 1. First, pick the target
                 target = self.get_closest_frontier(frontiers, rx, ry)
                 
-                # 2. Then visualize (Pass 'target' so it turns Green)
-                if frontiers:
-                    self.publish_frontiers(frontiers, selected=target)
+                self.publish_frontiers(frontiers, selected=target)
 
-                # 3. Then Process
+                if target:
+                    self.current_goal = target
+                    self.get_logger().info(f"Target Found: {target}")
+                    self.state = "PLANNING"
+                else:
+                    self.get_logger().info("No valid frontiers found. Spinning...")
+
+        if self.state == "WAITING":
+            self.move_ttbot(0.0, 0.0) 
+            
+            # 1. Update and Publish Inflated Map
+            self.inflated_map = self.generate_inflated_map()
+            self.publish_debug_map(self.inflated_map)
+            
+            if self.inflated_map is not None:
+                self.get_logger().info("Detecting Frontiers...")
+                frontiers = self.get_frontiers()
+                target = self.get_closest_frontier(frontiers, rx, ry)
+                
+                self.publish_frontiers(frontiers, selected=target)
+
                 if target:
                     self.current_goal = target
                     self.get_logger().info(f"Target Found: {target}")
@@ -393,7 +435,8 @@ class Task1(Node):
                                self.map_data.height)
             
             start = (rx, ry)
-            path_points = solver.solve(self.current_map, start, self.current_goal)
+            # Use INFLATED MAP for planning
+            path_points = solver.solve(self.inflated_map, start, self.current_goal)
             
             if path_points:
                 self.path = path_points
@@ -429,7 +472,6 @@ class Task1(Node):
             
             self.move_ttbot(lin, ang)
             
-            # Stop if reached goal OR if we run out of path
             dist_to_goal = math.hypot(self.current_goal[0] - rx, self.current_goal[1] - ry)
             if dist_to_goal < 0.3:
                 self.get_logger().info("Frontier Reached!")
