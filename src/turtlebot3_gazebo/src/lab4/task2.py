@@ -471,7 +471,7 @@ class Task2(Node):
 
         ranges = np.array(msg.ranges)
         
-        # Optimization: Only process obstacles within 1.0 meter. 
+        # Optimization: Only process obstacles within 1.0 meter.
         valid_indices = np.where((ranges < 1.0) & (ranges > 0.05))[0]
         
         map_changed = False

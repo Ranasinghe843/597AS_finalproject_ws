@@ -69,18 +69,8 @@ class GridAStar:
                 # Check Bounds
                 if 0 <= nx < self.w and 0 <= ny < self.h:
                     
-                    # Check Obstacles in the INFLATED MAP
-                    # Since we pass the inflated map to this solver, 
-                    # we only need to check if the pixel is > 0.
-                    # 0 = Safe Free Space
-                    # 100 = Wall or Buffer Zone
-                    # -1 = Unknown
-                    
-                    cell_val = grid[ny, nx]
-                    
-                    # Strict check: Can only move through KNOWN FREE space (0)
-                    # We treat Unknown (-1) as obstacle for path planning safety
-                    if cell_val > 0: 
+                    # RELAXED CHECK: Allow planning through noise < 50
+                    if grid[ny, nx] > 50: 
                         continue
 
                     new_g = g_score[current] + cost
@@ -112,17 +102,19 @@ class Task1(Node):
         self.path = []
         
         # Maps
-        self.raw_map = None      # The raw data from SLAM
-        self.inflated_map = None # The processed map with safety buffers
+        self.raw_map = None      
+        self.inflated_map = None 
         self.map_data = None 
+        self.map_has_changed = False 
         
         self.current_goal = None
         self.follow_idx = 0
         self.blacklist = []
+        self.visited_frontiers = [] 
         
         # Parameters
         self.lookahead_dist = 0.4
-        self.inflation_radius = 5 # Cells (approx 20cm)
+        self.inflation_radius = 4
         
         # TF
         self.tf_buffer = Buffer()
@@ -154,96 +146,103 @@ class Task1(Node):
 
     def map_cb(self, msg):
         self.map_data = msg.info
-        # ROS data is row-major, convert to 2D numpy
         raw = np.array(msg.data, dtype=np.int8)
         self.raw_map = raw.reshape((msg.info.height, msg.info.width))
+        self.map_has_changed = True 
 
     def generate_inflated_map(self):
-        """
-        Creates a new map where walls are thicker.
-        Returns the 2D numpy array of the inflated map.
-        """
         if self.raw_map is None: return None
-        
-        # Copy raw map
         inflated = self.raw_map.copy()
         
-        # Find walls (100)
-        # Note: We treat > 50 as walls
-        wall_indices = np.where(self.raw_map > 0)
-        
-        # If map is empty, return
+        wall_indices = np.where(self.raw_map > 50)
         if len(wall_indices[0]) == 0: return inflated
-
-        # Create a list of (y, x) tuples for walls
-        walls = list(zip(wall_indices[0], wall_indices[1]))
         
-        # Simple Inflation: Draw a box around every wall pixel
-        # (Using NumPy slicing for speed instead of iterating every pixel)
-        H, W = inflated.shape
+        wall_mask = (self.raw_map > 50)
         r = self.inflation_radius
-        
-        # Create a mask for walls to speed up dilation
-        wall_mask = (self.raw_map > 0)
-        
-        # Dilate using array shifting (Faster than scipy for simple kernels)
-        # We shift the wall mask in all directions and combine them
         expanded_walls = wall_mask.copy()
         for y_shift in range(-r, r + 1):
             for x_shift in range(-r, r + 1):
                 if x_shift == 0 and y_shift == 0: continue
-                # Roll/Shift the array
                 shifted = np.roll(wall_mask, shift=(y_shift, x_shift), axis=(0, 1))
                 expanded_walls |= shifted
-        
-        # Apply inflated walls to the map (Mark as 100)
-        # However, we must preserve Unknown (-1).
-        # Only overwrite Free (0) or Unknown (-1) with Wall (100) if it's in the buffer.
-        # Actually, for A*, we want the buffer to be "Forbidden".
-        # So we set expanded areas to 100.
         inflated[expanded_walls] = 100
-        
         return inflated
 
     def publish_debug_map(self, grid_2d):
-        """Publishes the Inflated Map to Rviz for debugging."""
         if grid_2d is None: return
-        
         msg = OccupancyGrid()
         msg.header.frame_id = "map"
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.info = self.map_data # Use same metadata as original map
-        
-        # Flatten and cast
+        msg.info = self.map_data 
         flat = grid_2d.flatten().astype(np.int8)
         msg.data = flat.tolist()
-        
         self.debug_map_pub.publish(msg)
 
-    def get_frontiers(self):
-        """
-        Finds frontiers using the INFLATED map.
-        This ensures all found points are strictly outside the safety buffer.
-        """
-        if self.inflated_map is None: return None
-
+    # --- HELPER: Check proximity to walls ---
+    def get_proximity(self, rx, ry):
+        """Returns max inflated map value around the robot."""
+        if self.inflated_map is None: return 0
+        res = self.map_data.resolution
+        ox = self.map_data.origin.position.x
+        oy = self.map_data.origin.position.y
+        gx = int((rx - ox) / res)
+        gy = int((ry - oy) / res)
+        
         h, w = self.inflated_map.shape
-        grid = self.inflated_map
+        max_val = 0
+        # Check 3x3 window around robot
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                ny, nx = gy + dy, gx + dx
+                if 0 <= nx < w and 0 <= ny < h:
+                    val = self.inflated_map[ny, nx]
+                    if val > max_val: max_val = val
+        return max_val
+
+    def find_nearest_safe_point(self, cx, cy, grid, max_radius=30):
+        h, w = grid.shape
+        if grid[cy, cx] < 50 and grid[cy, cx] >= 0:
+            return cx, cy
+
+        best_x, best_y = None, None
+        min_cost = float('inf')
+
+        x, y = 0, 0
+        dx, dy = -1, 0 
+        for _ in range(max_radius * max_radius * 4):
+            if (-max_radius <= x <= max_radius) and (-max_radius <= y <= max_radius):
+                nx, ny = cx + x, cy + y
+                if 0 <= nx < w and 0 <= ny < h:
+                    val = grid[ny, nx]
+                    if val != -1:
+                        if val == 0:
+                            return nx, ny
+                        if val < min_cost:
+                            min_cost = val
+                            best_x, best_y = nx, ny
+
+            if x == y or (x < 0 and x == -y) or (x > 0 and x == 1-y):
+                dx, dy = -dy, dx 
+            x, y = x + dx, y + dy
         
-        # Masks
-        free_mask = (grid == 0)
+        if best_x is not None and min_cost < 100:
+            return best_x, best_y
+        return None 
+
+    def get_frontiers(self):
+        if self.raw_map is None or self.inflated_map is None: return None
+        grid = self.raw_map
+        
+        # Relaxed detection
+        free_mask = (grid >= 0) & (grid < 25)
         unknown_mask = (grid == -1)
-        # Note: 'grid' already has walls inflated to 100.
         
-        # Edge Detection
         up = np.roll(unknown_mask, -1, axis=0)
         down = np.roll(unknown_mask, 1, axis=0)
         left = np.roll(unknown_mask, -1, axis=1)
         right = np.roll(unknown_mask, 1, axis=1)
         
         has_unknown_neighbor = up | down | left | right
-        
-        # Frontier = Free Space (Safe) AND Touching Unknown
         is_frontier = free_mask & has_unknown_neighbor
         
         ys, xs = np.where(is_frontier)
@@ -251,67 +250,49 @@ class Task1(Node):
 
         if not points: return None
 
-        # Clustering
         clusters = []
         visited = set()
         
         for point in points:
             if point in visited: continue
-            
             current_cluster = []
             queue = [point]
             visited.add(point)
-            
             while queue:
                 curr = queue.pop(0)
                 current_cluster.append(curr)
                 cx, cy = curr
-                
                 neighbors = [
                     (cx+1, cy), (cx-1, cy), (cx, cy+1), (cx, cy-1),
                     (cx+1, cy+1), (cx-1, cy-1), (cx-1, cy+1), (cx+1, cy-1)
                 ]
-                
                 for n in neighbors:
                     if n in points and n not in visited:
                         if abs(n[0] - cx) <= 1 and abs(n[1] - cy) <= 1:
                             visited.add(n)
                             queue.append(n)
             
-            if len(current_cluster) > 5:
+            if len(current_cluster) > 2:
                 clusters.append(current_cluster)
 
-        # Centroid Calculation (Snap to Valid Pixel)
         centroids = []
         res = self.map_data.resolution
         ox = self.map_data.origin.position.x
         oy = self.map_data.origin.position.y
         
         for cluster in clusters:
-            # 1. Geometric Centroid
             sum_x = sum(p[0] for p in cluster)
             sum_y = sum(p[1] for p in cluster)
-            avg_x = sum_x / len(cluster)
-            avg_y = sum_y / len(cluster)
+            avg_x = int(sum_x / len(cluster))
+            avg_y = int(sum_y / len(cluster))
             
-            # 2. Find the pixel in the cluster closest to the geometric centroid
-            # This ensures the target is actually a valid frontier pixel (Free space)
-            best_pixel = cluster[0]
-            min_dist = float('inf')
+            safe_point = self.find_nearest_safe_point(avg_x, avg_y, self.inflated_map)
             
-            for p in cluster:
-                dist = (p[0] - avg_x)**2 + (p[1] - avg_y)**2
-                if dist < min_dist:
-                    min_dist = dist
-                    best_pixel = p
-            
-            # Use that valid pixel as the target
-            cx, cy = best_pixel
-            
-            # Convert to World
-            wx = (cx * res) + ox + (res/2)
-            wy = (cy * res) + oy + (res/2)
-            centroids.append((wx, wy))
+            if safe_point:
+                cx, cy = safe_point
+                wx = (cx * res) + ox + (res/2)
+                wy = (cy * res) + oy + (res/2)
+                centroids.append((wx, wy))
             
         return centroids
 
@@ -321,13 +302,19 @@ class Task1(Node):
         best_point = None
         for (fx, fy) in centroids:
             
-            # Blacklist check
             is_bad = False
             for (bx, by) in self.blacklist:
-                if math.hypot(fx - bx, fy - by) < 0.5:
+                if math.hypot(fx - bx, fy - by) < 0.3:
                     is_bad = True
                     break
             if is_bad: continue
+
+            is_visited = False
+            for (vx, vy) in self.visited_frontiers:
+                if math.hypot(fx - vx, fy - vy) < 0.3: 
+                    is_visited = True
+                    break
+            if is_visited: continue
 
             dist = math.hypot(fx - rx, fy - ry)
             if dist > 0.5 and dist < best_dist:
@@ -378,25 +365,29 @@ class Task1(Node):
             msg.poses.append(pose)
         self.path_pub.publish(msg)
 
+    def process_map_and_find_frontier(self, rx, ry):
+        self.inflated_map = self.generate_inflated_map()
+        self.publish_debug_map(self.inflated_map)
+        
+        if self.inflated_map is not None:
+            frontiers = self.get_frontiers()
+            target = self.get_closest_frontier(frontiers, rx, ry)
+            self.publish_frontiers(frontiers, selected=target)
+            return target
+        return None
+
     def control_loop(self):
         pose = self.get_robot_pose()
         if not pose: return
         rx, ry, yaw = pose
 
+        # START State
         if self.state == "START":
             self.move_ttbot(0.15, 0.5) 
             
-            # 1. Update and Publish Inflated Map
-            self.inflated_map = self.generate_inflated_map()
-            self.publish_debug_map(self.inflated_map)
-            
-            if self.inflated_map is not None:
-                self.get_logger().info("Detecting Frontiers...")
-                frontiers = self.get_frontiers()
-                target = self.get_closest_frontier(frontiers, rx, ry)
-                
-                self.publish_frontiers(frontiers, selected=target)
-
+            if self.map_has_changed:
+                self.map_has_changed = False
+                target = self.process_map_and_find_frontier(rx, ry)
                 if target:
                     self.current_goal = target
                     self.get_logger().info(f"Target Found: {target}")
@@ -404,20 +395,12 @@ class Task1(Node):
                 else:
                     self.get_logger().info("No valid frontiers found. Spinning...")
 
-        if self.state == "WAITING":
+        elif self.state == "WAITING":
             self.move_ttbot(0.0, 0.0) 
             
-            # 1. Update and Publish Inflated Map
-            self.inflated_map = self.generate_inflated_map()
-            self.publish_debug_map(self.inflated_map)
-            
-            if self.inflated_map is not None:
-                self.get_logger().info("Detecting Frontiers...")
-                frontiers = self.get_frontiers()
-                target = self.get_closest_frontier(frontiers, rx, ry)
-                
-                self.publish_frontiers(frontiers, selected=target)
-
+            if self.map_has_changed:
+                self.map_has_changed = False
+                target = self.process_map_and_find_frontier(rx, ry)
                 if target:
                     self.current_goal = target
                     self.get_logger().info(f"Target Found: {target}")
@@ -427,15 +410,12 @@ class Task1(Node):
 
         elif self.state == "PLANNING":
             self.move_ttbot(0.0, 0.0)
-            
             solver = GridAStar(self.map_data.resolution, 
                                self.map_data.origin.position.x, 
                                self.map_data.origin.position.y,
                                self.map_data.width, 
                                self.map_data.height)
-            
             start = (rx, ry)
-            # Use INFLATED MAP for planning
             path_points = solver.solve(self.inflated_map, start, self.current_goal)
             
             if path_points:
@@ -453,11 +433,39 @@ class Task1(Node):
             self.publish_plan(self.path)
             if not self.path: return
             
+            # Dynamic Replanning
+            dist_to_goal = math.hypot(self.current_goal[0] - rx, self.current_goal[1] - ry)
+            if self.map_has_changed:
+                self.map_has_changed = False
+                new_target = self.process_map_and_find_frontier(rx, ry)
+                if new_target:
+                    dist_to_old = math.hypot(new_target[0] - self.current_goal[0], 
+                                             new_target[1] - self.current_goal[1])
+                    if dist_to_old > 1.0 and dist_to_goal > 0.5:
+                        self.get_logger().info("New better frontier found! Replanning.")
+                        self.current_goal = new_target
+                        self.state = "PLANNING"
+                        return
+
+            # --- IMPROVED WALL-AWARE CONTROLLER ---
+            prox = self.get_proximity(rx, ry)
+            
+            # Default Params
+            v_target = 0.22
+            l_dist = self.lookahead_dist # 0.4
+            
+            # 1. Slow Down Near Walls
+            # If prox > 0, we are touching buffer/wall
+            if prox > 0: 
+                v_target = 0.1
+                l_dist = 0.25 # Tighten lookahead to avoid corner cutting
+            
+            # 2. Lookahead Logic
             target = self.path[-1] 
             for i in range(self.follow_idx, len(self.path)):
                 px, py = self.path[i]
                 dist = math.hypot(px - rx, py - ry)
-                if dist > self.lookahead_dist:
+                if dist > l_dist:
                     target = (px, py)
                     self.follow_idx = i
                     break
@@ -466,15 +474,20 @@ class Task1(Node):
             desired_yaw = math.atan2(ty - ry, tx - rx)
             err = (desired_yaw - yaw + math.pi) % (2.0*math.pi) - math.pi
             
-            ang = max(-1.0, min(1.0, 1.5 * err))
-            lin = 0.22
-            if abs(err) > 1.0: lin = 0.0 
+            # 3. Aggressive Turning
+            # Increased gain to 2.0 to correct heading faster
+            ang = max(-1.0, min(1.0, 2.0 * err))
             
-            self.move_ttbot(lin, ang)
+            # 4. Strict Stop-and-Turn
+            # If error is > ~30 deg, stop moving to rotate
+            if abs(err) > 0.5: 
+                v_target = 0.0 
             
-            dist_to_goal = math.hypot(self.current_goal[0] - rx, self.current_goal[1] - ry)
-            if dist_to_goal < 0.3:
+            self.move_ttbot(v_target, ang)
+            
+            if dist_to_goal < 0.1:
                 self.get_logger().info("Frontier Reached!")
+                self.visited_frontiers.append(self.current_goal)
                 self.state = "WAITING"
 
     def move_ttbot(self, speed, heading):

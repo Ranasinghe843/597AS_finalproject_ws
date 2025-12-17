@@ -342,24 +342,28 @@ class Task2(Node):
         # Map File Load
         self.map_file_path = os.path.join(get_package_share_directory('turtlebot3_gazebo'), "maps", "map")
         self.get_logger().info(self.map_file_path)
+        self.mp_running = MapProcessor(self.map_file_path)
+        self.running_kr = 6
+        self.mp_running.inflate_map(self.mp_running.rect_kernel(self.running_kr,1), True)
         self.mp = MapProcessor(self.map_file_path)
-        
-        # Use a safe kernel size (11) for initial inflation
-        self.kr = self.mp.rect_kernel(11,1)
-        self.mp.inflate_map(self.kr, True)
-        
-        self.clean_static_map = np.copy(self.mp.inf_map_img_array)
+        self.kr = 11
+        self.mp.inflate_map(self.mp.rect_kernel(self.kr,1), True)
         self.map_ready = True
-        h, w = self.mp.map.image_array.shape
-        self.get_logger().info(f"Local map loaded: {w}x{h}")
 
         self.rate = self.create_rate(10)
 
     def __goal_pose_cbk(self, data):
+        """! Callback to catch the goal pose.
+        @param  data    PoseStamped object from RVIZ.
+        @return None.
+        """
         self.goal_pose = data
         self.goal_pose.header.frame_id = "map"
-        # Reset map to static map (remove dynamic obstacles from previous run)
-        self.mp.inf_map_img_array = np.copy(self.clean_static_map)
+        self.mp_running = MapProcessor(self.map_file_path)
+        self.mp_running.inflate_map(self.mp_running.rect_kernel(self.running_kr,1), True)
+        self.mp = MapProcessor(self.map_file_path)
+        self.mp.inflate_map(self.mp.rect_kernel(self.kr,1), True)
+        self.graph_built = False
         self.goal_ready = True
         self.plan_dirty = True
         self.get_logger().info(
@@ -402,42 +406,61 @@ class Task2(Node):
         self.debug_pub.publish(msg)
     
     def __scan_cb(self, msg):
-        """! OPTIMIZED Callback: Updates map locally via slicing."""
-        if not self.pose_ready or not self.map_ready: return
+        """! Callback to process Lidar data, update map, and trigger replanning."""
+        if not self.pose_ready or not self.map_ready:
+            return
 
+        # 1. Get current robot pose
         rx = self.ttbot_pose.pose.position.x
         ry = self.ttbot_pose.pose.position.y
         yaw = self._yaw_from_quat(self.ttbot_pose.pose.orientation)
+
         ranges = np.array(msg.ranges)
         
-        # Only process close obstacles
+        # Optimization: Only process obstacles within 1.0 meter. 
         valid_indices = np.where((ranges < 1.0) & (ranges > 0.05))[0]
         
         map_changed = False
         H, W = self.mp.inf_map_img_array.shape
         
-        # Kernel Radius (5 matches kernel size 11)
-        inf_radius = 5 
+        # Kernel Radius: You used rect_kernel(11,1), so radius is 5 (11 // 2)
+        #kr_inf_radius = self.kr // 2
+        kr_inf_radius = 2
+        kr_running_inf_radius = self.running_kr // 2
 
         for i in valid_indices:
             r = ranges[i]
             theta = msg.angle_min + i * msg.angle_increment
+            
+            # 2. Global Coordinates
             ox = rx + r * math.cos(yaw + theta)
             oy = ry + r * math.sin(yaw + theta)
+            
+            # 3. Grid Coordinates
             ix, iy = self.world_to_grid(ox, oy)
 
+            # 4. Update Map LOCALLY
             if 0 <= ix < W and 0 <= iy < H:
-                if self.mp.inf_map_img_array[iy, ix] == 0:
+                # Check center pixel. If it's 0 (free), this is a NEW obstacle.
+                if self.mp_running.inf_map_img_array[iy, ix] == 0:
                     map_changed = True
-                    # NumPy Slicing Optimization
-                    x_min = max(0, ix - inf_radius)
-                    x_max = min(W, ix + inf_radius + 1)
-                    y_min = max(0, iy - inf_radius)
-                    y_max = min(H, iy + inf_radius + 1)
+
+                    x_min = max(0, ix - kr_running_inf_radius)
+                    x_max = min(W, ix + kr_running_inf_radius + 1)
+                    y_min = max(0, iy - kr_running_inf_radius)
+                    y_max = min(H, iy + kr_running_inf_radius + 1)
+                    self.mp_running.inf_map_img_array[y_min:y_max, x_min:x_max] = 100
+                    
+                    x_min = max(0, ix - kr_inf_radius)
+                    x_max = min(W, ix + kr_inf_radius + 1)
+                    y_min = max(0, iy - kr_inf_radius)
+                    y_max = min(H, iy + kr_inf_radius + 1)
                     self.mp.inf_map_img_array[y_min:y_max, x_min:x_max] = 100
 
-        # Collision Check for RRT path
+        # 5. Collision Check & Re-planning
+        # Only runs if we actually added new obstacles
         if map_changed and self.path.poses:
+            # Check the next 20 waypoints to see if the new obstacle blocks our path
             start_check = self.follow_idx
             end_check = min(len(self.path.poses), self.follow_idx + 20)
             
@@ -447,16 +470,16 @@ class Task2(Node):
                 wx, wy = self.world_to_grid(wp.x, wp.y)
                 
                 if 0 <= wx < W and 0 <= wy < H:
+                    # If path waypoint is now inside an obstacle (value > 0)
                     if self.mp.inf_map_img_array[wy, wx] > 0:
                         collision_detected = True
                         break
             
             if collision_detected:
-                self.get_logger().warn("RRT* Path Blocked! Replanning...")
-                self.move_ttbot(0.0, 0.0) 
-                self.path = Path()        
-                self.plan_dirty = True    
-                # self.graph_built = False # Not used in RRT*
+                self.get_logger().warn("Path Blocked by Dynamic Obstacle! Replanning...")
+                self.move_ttbot(0.0, 0.0) # Stop immediately
+                self.path = Path()        # Clear current path
+                self.plan_dirty = True    # Request A*
 
     def plan_path_rrt(self):
         if not self.goal_ready or not self.pose_ready: return Path()
@@ -473,7 +496,7 @@ class Task2(Node):
         rrt_star = RRTStar(start, goal, self.mp, 
                            expand_dis=0.3, 
                            path_resolution=0.05, 
-                           max_iter=3000) # 500 iter is faster, increase if path is poor
+                           max_iter=3000)
         
         path_points = rrt_star.plan()
 

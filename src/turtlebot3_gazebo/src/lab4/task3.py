@@ -311,7 +311,9 @@ class Task3(Node):
         self.plan_dirty = False
         self.replan_needed = False
         self.goal_reached = True
-        self.goal_list = [[7.57, -5.42], [2.61, 0.49]]
+        self.goal_list = [[7.57, -5.42], 
+                          [2.61, 0.49],
+                          [-6.52, -5.53]]
         self.current_goal = -1
 
         self.follow_idx = 0
