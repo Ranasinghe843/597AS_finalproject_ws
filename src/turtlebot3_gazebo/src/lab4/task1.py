@@ -9,7 +9,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 class Task1(Node):
     """
     Task 1: Autonomous Mapping
-    Strategy: Drive Straight -> Align -> PD Wall Follower (with Doorway Logic)
+    Strategy: Drive Straight -> Align -> Tight-Cornering Wall Follower
     """
     def __init__(self):
         super().__init__('task1_node')
@@ -29,24 +29,22 @@ class Task1(Node):
         self.scan_data = None
         
         # --- State Management ---
-        # FIND_WALL: Drive straight until impact
-        # ALIGN_LEFT: Turn in place to face the open path
-        # FOLLOW_WALL: The main mapping logic
         self.state = 'FIND_WALL'
         
         # --- Tuning Parameters ---
         self.target_dist = 0.50   
         self.kp = 1.0
         self.kd = 5.0             
-        self.cruising_speed = 0.35
         
-        self.safe_front_dist = 0.60    # Standard turning distance
-        self.door_front_dist = 0.30    # "Brave" distance for doorways
+        self.cruising_speed = 0.35     # Normal speed
+        self.cornering_speed = 0.10    # Slow speed for tight turns (The Fix)
+        
+        self.safe_front_dist = 0.60    
+        self.door_front_dist = 0.30    # Distance allowed when cornering
 
-        # PD Memory
         self.prev_error = 0.0
 
-        self.get_logger().info('Task1 Node Started: 3-Stage Logic')
+        self.get_logger().info('Task1 Node Started: Tight Cornering Logic')
 
     def scan_callback(self, msg):
         self.scan_data = msg
@@ -65,60 +63,75 @@ class Task1(Node):
         ranges = self.scan_data.ranges
         
         # --- 1. SENSOR PROCESSING ---
-        front_cone = ranges[-10:] + ranges[:10]
+        # Front Cone: +/- 10 degrees
+        front_cone = ranges[-15:] + ranges[:15]
         d_front = self.get_min_range(front_cone)
 
+        # Right Cone: 280-320 (Look-Ahead)
         right_cone = ranges[280:320]
         d_right = self.get_min_range(right_cone)
+        
+        # Front-Right Corner Check (Indices 320-350)
+        # This checks for the specific "corner right after doorway"
+        corner_cone = ranges[320:350]
+        d_corner = self.get_min_range(corner_cone)
 
         # --- 2. STATE MACHINE ---
 
         # STATE 1: FIND WALL
-        # Drive straight until we hit the first wall.
         if self.state == 'FIND_WALL':
             if d_front < self.safe_front_dist:
-                self.state = 'ALIGN_LEFT' # Transition to Align Mode
+                self.state = 'ALIGN_LEFT'
                 self.get_logger().info('Wall Found! Aligning Left...')
             else:
                 twist.linear.x = self.cruising_speed
-                twist.angular.z = 0.0
                 self.cmd_vel_pub.publish(twist)
                 return 
 
-        # STATE 2: ALIGN LEFT (The Fix)
-        # We are staring at a wall. Turn Left until we see open space.
-        # We ignore "Doorway Logic" here to prevent crashing.
+        # STATE 2: ALIGN LEFT
         if self.state == 'ALIGN_LEFT':
-            if d_front > self.safe_front_dist + 0.1: # Add buffer (0.7m) so we don't switch back too soon
+            if d_front > self.safe_front_dist + 0.1:
                 self.state = 'FOLLOW_WALL'
                 self.get_logger().info('Aligned! Switching to Wall Follower.')
             else:
                 twist.linear.x = 0.0
-                twist.angular.z = 0.8 # Consistent turn speed
+                twist.angular.z = 0.8
                 self.cmd_vel_pub.publish(twist)
                 return
 
         # STATE 3: FOLLOW WALL
-        # Now we are safely parallel, we can use the advanced logic.
         if self.state == 'FOLLOW_WALL':
             
-            # DOORWAY CHECK:
-            # Only if we are in this state do we allow the threshold to drop.
+            # --- DOORWAY / CORNER LOGIC ---
+            # If Right is open, we are at a door.
             if d_right > 1.0:
-                active_thresh = self.door_front_dist # 0.30m
+                active_thresh = self.door_front_dist
+                # THE FIX: Slow down to wrap tightly around the corner
+                current_speed = self.cornering_speed
             else:
-                active_thresh = self.safe_front_dist # 0.60m
+                active_thresh = self.safe_front_dist
+                current_speed = self.cruising_speed
 
-            # Priority 1: Emergency Front Blocked
-            if d_front < active_thresh:
+            # --- CONTROL LOGIC ---
+
+            # Priority 0: IMMEDIATE CORNER CRASH (The Z-Turn Protection)
+            # If we are turning right but a corner is RIGHT in our face (d_corner), 
+            # we must panic turn LEFT briefly to clear it.
+            if d_corner < 0.25:
+                 twist.linear.x = 0.0
+                 twist.angular.z = 1.0 # Quick bump left
+                 self.get_logger().info('Tight Corner! Bumping Left.', throttle_duration_sec=1)
+
+            # Priority 1: Front Blocked
+            elif d_front < active_thresh:
                 twist.linear.x = 0.0
                 twist.angular.z = 1.2  # Turn Left fast
                 self.prev_error = 0.0  
-                self.get_logger().info('Corner! Turning Left.', throttle_duration_sec=1)
+                self.get_logger().info('Front Blocked. Turning Left.', throttle_duration_sec=1)
 
             # Priority 2: PD Control
             else:
-                twist.linear.x = self.cruising_speed
+                twist.linear.x = current_speed
                 
                 # Calculate Error
                 error = d_right - self.target_dist
