@@ -31,9 +31,9 @@ class Task1(Node):
         self.kd = 5.0             
         
         self.cruising_speed = 0.35
-        self.cornering_speed = 0.10
+        self.cornering_speed = 0.05
         
-        self.safe_front_dist = 0.60    
+        self.safe_front_dist = 0.60
         self.door_front_dist = 0.30
 
         self.prev_error = 0.0
@@ -62,13 +62,13 @@ class Task1(Node):
         right_cone = ranges[280:320]
         d_right = self.get_min_range(right_cone)
         
-        corner_cone = ranges[320:350]
+        corner_cone = ranges[340:300]
         d_corner = self.get_min_range(corner_cone)
 
         if self.state == 'FIND_WALL':
             if d_front < self.safe_front_dist:
                 self.state = 'ALIGN_LEFT'
-                self.get_logger().info('Wall Found! Aligning Left')
+                self.get_logger().info('Wall Found!')
             else:
                 twist.linear.x = self.cruising_speed
                 self.cmd_vel_pub.publish(twist)
@@ -93,12 +93,13 @@ class Task1(Node):
                 active_thresh = self.safe_front_dist
                 current_speed = self.cruising_speed
 
-            if d_corner < 0.25:
+            if d_corner > 1.0 and d_front < active_thresh:
                  twist.linear.x = 0.0
-                 twist.angular.z = 1.0
-                 self.get_logger().info('Tight Corner!', throttle_duration_sec=1)
+                 twist.angular.z = -1.0
+                 self.get_logger().info('Tight Corner', throttle_duration_sec=1)
 
             elif d_front < active_thresh:
+            # if d_front < active_thresh:
                 twist.linear.x = 0.0
                 twist.angular.z = 1.2
                 self.prev_error = 0.0  
@@ -116,6 +117,7 @@ class Task1(Node):
                 turn_cmd = -(self.kp * error + self.kd * derivative)
                 
                 twist.angular.z = max(min(turn_cmd, 1.2), -1.2)
+
                 self.prev_error = error
 
             self.cmd_vel_pub.publish(twist)

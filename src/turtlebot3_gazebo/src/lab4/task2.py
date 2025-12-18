@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import sys
 import os
 import numpy as np
 import math
@@ -8,7 +7,7 @@ import heapq
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Pose, Twist
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist
 from std_msgs.msg import Float32
 from copy import copy
 import yaml
@@ -18,7 +17,6 @@ import pandas as pd
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-import time
 
 class Map():
     def __init__(self, map_name):
@@ -211,11 +209,9 @@ class AStarFast:
     def __init__(self, in_tree):
         self.in_tree = in_tree
 
-        # dist/heuristic/via as before
         self.dist = {name: float('inf') for name, _ in in_tree.g.items()}
         self.via  = {name: 0 for name, _ in in_tree.g.items()}
 
-        # Preserve your heuristic exactly (Euclidean over indices parsed from "iy,ix")
         self.h = {}
         end = tuple(map(int, self.in_tree.end.split(',')))
         for name, _ in in_tree.g.items():
@@ -224,17 +220,13 @@ class AStarFast:
             dy = end[1] - start[1]
             self.h[name] = math.hypot(dx, dy)
 
-        # For tie-breaking identical to your stable sort of the full list:
-        # use the original insertion index of each node in in_tree.g
         self._ord = {}
         for idx, name in enumerate(in_tree.g.keys()):
             self._ord[name] = idx
 
-        # closed set to avoid re-expanding popped nodes (your old code effectively did this)
         self._closed = set()
 
     def __f(self, name):
-        # f = g + h
         return self.dist[name] + self.h[name]
 
     def solve(self, sn, en):
@@ -247,7 +239,6 @@ class AStarFast:
         goal  = en.name
         self.dist[start] = 0.0
 
-        # Min-heap of (f, tie, name). tie = original insertion order (stable-sort mimic)
         open_heap = []
 
         for name in self.in_tree.g.keys():
@@ -257,7 +248,6 @@ class AStarFast:
         while open_heap:
             f, tie, u = heapq.heappop(open_heap)
 
-            # Skip stale entries (if a better g came later) or already closed
             if u in self._closed or f != self.__f(u):
                 continue
 
@@ -269,7 +259,6 @@ class AStarFast:
             u_node = self.in_tree.g[u]
             ug = self.dist[u]
 
-            # Expand in EXACT child order (your graph stored it)
             for i in range(len(u_node.children)):
                 c = u_node.children[i]
                 v = c.name
@@ -279,7 +268,6 @@ class AStarFast:
                 if new_g < self.dist[v]:
                     self.dist[v] = new_g
                     self.via[v]  = u
-                    # Maintain the same tiebreak (insertion order) as your stable sort
                     heapq.heappush(open_heap, (self.dist[v] + self.h[v], self._ord[v], v))
 
     def reconstruct_path(self, sn, en):
@@ -427,7 +415,6 @@ class Task2(Node):
         return x, y
     
     def publish_debug_map(self):
-        """Publishes the internal inflated map to Rviz."""
         if self.mp.inf_map_img_array is None:
             return
 
@@ -435,24 +422,17 @@ class Task2(Node):
         msg.header.frame_id = "map"
         msg.header.stamp = self.get_clock().now().to_msg()
 
-        # Copy metadata from the original map configuration
         msg.info.resolution = float(self.mp.map.map_df.resolution[0])
         msg.info.width = int(self.mp.map.image_array.shape[1])
         msg.info.height = int(self.mp.map.image_array.shape[0])
         
-        # Origin
         msg.info.origin.position.x = float(self.mp.map.map_df.origin[0][0])
         msg.info.origin.position.y = float(self.mp.map.map_df.origin[0][1])
         msg.info.origin.position.z = 0.0
         msg.info.origin.orientation.w = 1.0
 
-        # --- THE FIX ---
-        # 1. Flip the array upside down (Vertical Flip)
-        # Because PIL/NumPy (0,0 is Top-Left) vs ROS (0,0 is Bottom-Left)
         corrected_array = np.flipud(self.mp.inf_map_img_array)
 
-        # 2. Flatten and Cast
-        # Map 255 (Obstacle) -> 100 for Rviz
         flat_data = corrected_array.flatten()
         flat_data = np.where(flat_data > 0, 100, 0).astype(np.int8)
         
@@ -460,25 +440,20 @@ class Task2(Node):
         self.debug_pub.publish(msg)
     
     def __scan_cb(self, msg):
-        """! Callback to process Lidar data, update map, and trigger replanning."""
         if not self.pose_ready or not self.map_ready:
             return
 
-        # 1. Get current robot pose
         rx = self.ttbot_pose.pose.position.x
         ry = self.ttbot_pose.pose.position.y
         yaw = self._yaw_from_quat(self.ttbot_pose.pose.orientation)
 
         ranges = np.array(msg.ranges)
         
-        # Optimization: Only process obstacles within 1.0 meter.
         valid_indices = np.where((ranges < 1.0) & (ranges > 0.05))[0]
         
         map_changed = False
         H, W = self.mp.inf_map_img_array.shape
         
-        # Kernel Radius: You used rect_kernel(11,1), so radius is 5 (11 // 2)
-        #kr_inf_radius = self.kr // 2
         kr_inf_radius = 2
         kr_running_inf_radius = self.running_kr // 2
 
@@ -486,16 +461,12 @@ class Task2(Node):
             r = ranges[i]
             theta = msg.angle_min + i * msg.angle_increment
             
-            # 2. Global Coordinates
             ox = rx + r * math.cos(yaw + theta)
             oy = ry + r * math.sin(yaw + theta)
             
-            # 3. Grid Coordinates
             ix, iy = self.world_to_grid(ox, oy)
 
-            # 4. Update Map LOCALLY
             if 0 <= ix < W and 0 <= iy < H:
-                # Check center pixel. If it's 0 (free), this is a NEW obstacle.
                 if self.mp_running.inf_map_img_array[iy, ix] == 0:
                     map_changed = True
 
@@ -511,10 +482,7 @@ class Task2(Node):
                     y_max = min(H, iy + kr_inf_radius + 1)
                     self.mp.inf_map_img_array[y_min:y_max, x_min:x_max] = 100
 
-        # 5. Collision Check & Re-planning
-        # Only runs if we actually added new obstacles
         if map_changed and self.path.poses:
-            # Check the next 20 waypoints to see if the new obstacle blocks our path
             start_check = self.follow_idx
             end_check = min(len(self.path.poses), self.follow_idx + 20)
             
@@ -524,17 +492,46 @@ class Task2(Node):
                 wx, wy = self.world_to_grid(wp.x, wp.y)
                 
                 if 0 <= wx < W and 0 <= wy < H:
-                    # If path waypoint is now inside an obstacle (value > 0)
                     if self.mp.inf_map_img_array[wy, wx] > 0:
                         collision_detected = True
                         break
             
             if collision_detected:
                 self.get_logger().warn("Path Blocked by Dynamic Obstacle! Replanning...")
-                self.move_ttbot(0.0, 0.0) # Stop immediately
-                self.path = Path()        # Clear current path
-                self.plan_dirty = True    # Request A*
-                self.graph_built = False  # Force graph rebuild
+                self.move_ttbot(0.0, 0.0)
+                self.path = Path()
+                self.plan_dirty = True
+                self.graph_built = False
+
+    def find_closest_free_node(self, start_ix, start_iy, max_radius=50):
+        queue = [(start_ix, start_iy)]
+        visited = set([(start_ix, start_iy)])
+        
+        directions = [
+            (0, 1), (0, -1), (1, 0), (-1, 0),
+            (1, 1), (1, -1), (-1, 1), (-1, -1)
+        ]
+
+        while queue:
+            cx, cy = queue.pop(0)
+
+            key = f"{cy},{cx}"
+            if key in self.mp.map_graph.g:
+                return key
+
+            if math.hypot(cx - start_ix, cy - start_iy) > max_radius:
+                continue
+
+            for dx, dy in directions:
+                nx, ny = cx + dx, cy + dy
+                
+                H, W = self.mp.inf_map_img_array.shape
+                if 0 <= nx < W and 0 <= ny < H:
+                    if (nx, ny) not in visited:
+                        visited.add((nx, ny))
+                        queue.append((nx, ny))
+        
+        return None
 
     def a_star_path_planner(self, start_pose, end_pose):
         """! A Start path planner.
@@ -564,10 +561,19 @@ class Task2(Node):
         self.get_logger().info(s_key)
         self.get_logger().info(g_key)
 
-        if s_key not in self.mp.map_graph.g or g_key not in self.mp.map_graph.g:
-            self.get_logger().warn("Start or goal in obstacle/outside free space")
-            # path.poses.append(start_pose); path.poses.append(end_pose)
-            # path.poses = None
+        if s_key not in self.mp.map_graph.g:
+            self.get_logger().warn(f"Start node {s_key} is in obstacle. Searching for closest valid node...")
+            valid_start = self.find_closest_free_node(s_ix, s_iy)
+            
+            if valid_start:
+                s_key = valid_start
+                self.get_logger().info(f"Start relocated to valid node: {s_key}")
+            else:
+                self.get_logger().error("Could not find any valid start node nearby.")
+                return path
+
+        if g_key not in self.mp.map_graph.g:
+            self.get_logger().warn("Goal is in obstacle/outside free space. Planning aborted.")
             return path
         
         self.mp.map_graph.root = s_key

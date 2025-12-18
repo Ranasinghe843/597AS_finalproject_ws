@@ -1,44 +1,67 @@
 #!/usr/bin/env python3
 
 import rclpy
+import cv2
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, Point
+from sensor_msgs.msg import LaserScan, Image
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from cv_bridge import CvBridge
 
-class Task1(Node):
+class Task3(Node):
     def __init__(self):
-        super().__init__('task1_node')
-
+        super().__init__('task3_node')
+        
         qos_policy = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10
         )
         
-        self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, qos_policy
-        )
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, qos_policy)
+        self.sub_img = self.create_subscription(Image, '/camera/image_raw', self.__img_cbk, 10)
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.__ttbot_pose_cbk, 10)
+
         
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub_red = self.create_publisher(Point, '/red_pos', 10)
+        self.pub_blue = self.create_publisher(Point, '/blue_pos', 10)
+        self.pub_green = self.create_publisher(Point, '/green_pos', 10)
+
+
         self.timer = self.create_timer(0.1, self.timer_cb)
+        self.bridge = CvBridge()
+
+        self.ttbot_pose = PoseStamped()
         self.scan_data = None
         
         self.state = 'FIND_WALL'
         
-        self.target_dist = 0.50   
+        self.target_dist = 0.50
         self.kp = 1.0
         self.kd = 5.0             
         
         self.cruising_speed = 0.35
         self.cornering_speed = 0.10
         
-        self.safe_front_dist = 0.60    
+        self.safe_front_dist = 0.60
         self.door_front_dist = 0.30
 
         self.prev_error = 0.0
 
         self.get_logger().info('Task1 Node Started')
+
+    def __ttbot_pose_cbk(self, data):
+        """! Callback to catch the position of the vehicle.
+        @param  data    PoseWithCovarianceStamped object from amcl.
+        @return None.
+        """
+        self.ttbot_pose.header = data.header
+        self.ttbot_pose.pose = data.pose.pose
+        self.ttbot_pose.header.frame_id = "map"
+        self.pose_ready = True
+        self.get_logger().info(
+            'ttbot_pose: {:.4f}, {:.4f}'.format(self.ttbot_pose.pose.position.x, self.ttbot_pose.pose.position.y))
 
     def scan_callback(self, msg):
         self.scan_data = msg
@@ -120,15 +143,19 @@ class Task1(Node):
 
             self.cmd_vel_pub.publish(twist)
 
+    
+
 def main(args=None):
     rclpy.init(args=args)
-    task1 = Task1()
+
+    task3 = Task3()
+
     try:
-        rclpy.spin(task1)
+        rclpy.spin(task3)
     except KeyboardInterrupt:
         pass
     finally:
-        task1.destroy_node()
+        task3.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
